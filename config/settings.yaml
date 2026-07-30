@@ -1,0 +1,29 @@
+# M1 = 60
+timeframe_seconds: 60
+
+supertrend:
+  atr_period: 10
+  multiplier: 3
+
+min_payout_percent: 89
+
+confirmation_delay_seconds: 30
+
+instruments:
+  - EURUSD_OTC
+  - GBPUSD_OTC
+  - USDJPY_OTC
+  - AUDCAD_OTC
+  - NZDUSD_OTC
+  # ... 50 інструментів
+
+telegram:
+  bot_token: "8869503014:AAEO88kSpkSe1tWnTYMplVcMjRxAwLkHaZM"
+  chat_id: "1629508204"
+
+# Джерело даних: "simulator" -реальні дані пізніше
+data_source: "simulator"
+
+logging:
+  level: "INFO"
+  file: "logs/bot.log"
