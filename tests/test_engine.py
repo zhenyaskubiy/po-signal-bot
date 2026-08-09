@@ -2,12 +2,14 @@
 Перевірка InstrumentEngine — повний ланцюжок: свічка → Supertrend →
 підрахунок серії → чергу сигналів, без реального очікування секунд
 (process_closed_candle / process_confirmation викликаються напряму).
+
 """
 
 from __future__ import annotations
 
 from core.candle import Candle
 from core.engine import InstrumentEngine
+from core.runtime_settings import RuntimeSettingsStore
 from core.signal_queue import SignalQueue, SignalType
 
 
@@ -26,6 +28,7 @@ def uptrend_candle(price: float, ts: float) -> Candle:
 
 def test_full_pipeline_produces_warning_and_signal() -> None:
     signal_queue = SignalQueue(confirmation_delay_seconds=30)
+    runtime_settings = RuntimeSettingsStore(expiration_seconds=60, required_anti_trend_candles=4)
     engine = InstrumentEngine(
         instrument="EURUSD_OTC",
         signal_queue=signal_queue,
@@ -33,6 +36,7 @@ def test_full_pipeline_produces_warning_and_signal() -> None:
         supertrend_multiplier=2,
         timeframe_seconds=60,
         min_payout_percent=89,
+        runtime_settings=runtime_settings,
     )
 
     ts = 0.0
@@ -77,6 +81,7 @@ def test_full_pipeline_produces_warning_and_signal() -> None:
 
 def test_low_payout_blocks_signal() -> None:
     signal_queue = SignalQueue(confirmation_delay_seconds=30)
+    runtime_settings = RuntimeSettingsStore(expiration_seconds=60, required_anti_trend_candles=4)
     engine = InstrumentEngine(
         instrument="LOWPAYOUT_OTC",
         signal_queue=signal_queue,
@@ -84,6 +89,7 @@ def test_low_payout_blocks_signal() -> None:
         supertrend_multiplier=2,
         timeframe_seconds=60,
         min_payout_percent=89,
+        runtime_settings=runtime_settings,
     )
 
     ts = 0.0

@@ -35,6 +35,7 @@ class SignalEvent:
     instrument: str
     payout: float
     timeframe_seconds: int
+    expiration_seconds: int
     message: str
 
 
@@ -45,6 +46,7 @@ class _PendingConfirmation:
     deadline: float  # unix-час, коли перевіряти 5-ту свічку
     payout: float
     timeframe_seconds: int
+    expiration_seconds: int
     resolved: bool = False
 
 
@@ -64,6 +66,7 @@ class SignalQueue:
         locked_color: str,
         payout: float,
         timeframe_seconds: int,
+        expiration_seconds: int,
         now: Optional[float] = None,
     ) -> Optional[SignalEvent]:
         """
@@ -85,6 +88,7 @@ class SignalQueue:
             deadline=now + self.confirmation_delay_seconds,
             payout=payout,
             timeframe_seconds=timeframe_seconds,
+            expiration_seconds=expiration_seconds,
         )
 
         direction_label = "PUT (SELL)" if locked_color == "bearish" else "CALL (BUY)"
@@ -94,6 +98,7 @@ class SignalQueue:
             f"Напрямок: {direction_label}\n"
             f"Виплата: {payout}%\n"
             f"Таймфрейм: {timeframe_seconds} сек\n"
+            f"Експірація: {expiration_seconds} сек\n"
             "Закрилися 4 антитрендові свічки. Очікуємо підтвердження."
         )
         return SignalEvent(
@@ -101,6 +106,7 @@ class SignalQueue:
             instrument=instrument,
             payout=payout,
             timeframe_seconds=timeframe_seconds,
+            expiration_seconds=expiration_seconds,
             message=message,
         )
 
@@ -140,13 +146,15 @@ class SignalQueue:
             f"{emoji} {signal_type.value}\n"
             f"Інструмент: {instrument}\n"
             f"Виплата: {pending.payout}%\n"
-            f"Таймфрейм: {pending.timeframe_seconds} сек"
+            f"Таймфрейм: {pending.timeframe_seconds} сек\n"
+            f"Експірація: {pending.expiration_seconds} сек"
         )
         return SignalEvent(
             type=signal_type,
             instrument=instrument,
             payout=pending.payout,
             timeframe_seconds=pending.timeframe_seconds,
+            expiration_seconds=pending.expiration_seconds,
             message=message,
         )
 

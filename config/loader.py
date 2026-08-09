@@ -1,3 +1,12 @@
+"""
+Завантаження та перевірка конфігурації з settings.yaml.
+
+Використання:
+    from config.loader import load_config
+    cfg = load_config()
+    print(cfg.timeframe_seconds)
+"""
+
 from __future__ import annotations
 
 import os
@@ -31,6 +40,8 @@ class LoggingConfig:
 @dataclass
 class BotConfig:
     timeframe_seconds: int
+    expiration_seconds: int
+    required_anti_trend_candles: int
     supertrend: SupertrendConfig
     min_payout_percent: float
     confirmation_delay_seconds: int
@@ -62,6 +73,8 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> BotConfig:
 
         cfg = BotConfig(
             timeframe_seconds=int(raw["timeframe_seconds"]),
+            expiration_seconds=int(raw.get("expiration_seconds", raw["timeframe_seconds"])),
+            required_anti_trend_candles=int(raw.get("required_anti_trend_candles", 4)),
             supertrend=supertrend,
             min_payout_percent=float(raw["min_payout_percent"]),
             confirmation_delay_seconds=int(raw["confirmation_delay_seconds"]),
@@ -80,6 +93,10 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> BotConfig:
 def _validate(cfg: BotConfig) -> None:
     if cfg.timeframe_seconds <= 0:
         raise ConfigError("timeframe_seconds повинен бути додатним числом.")
+    if cfg.expiration_seconds <= 0:
+        raise ConfigError("expiration_seconds повинен бути додатним числом.")
+    if cfg.required_anti_trend_candles <= 0:
+        raise ConfigError("required_anti_trend_candles повинен бути додатним числом.")
     if cfg.supertrend.atr_period <= 0:
         raise ConfigError("supertrend.atr_period повинен бути додатним числом.")
     if cfg.supertrend.multiplier <= 0:

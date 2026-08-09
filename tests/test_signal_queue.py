@@ -2,8 +2,6 @@
 Перевірка черги сигналів: попередження, підтвердження, скасування,
 захист від дублікатів (п.12 ТЗ).
 
-Запуск:
-    python -m tests.test_signal_queue
 """
 
 from __future__ import annotations
@@ -22,7 +20,8 @@ def test_warning_sent_once() -> None:
     queue = SignalQueue(confirmation_delay_seconds=30)
 
     warning = queue.on_series_reached_four(
-        instrument="EURUSD_OTC", locked_color="bearish", payout=89, timeframe_seconds=60, now=1000.0
+        instrument="EURUSD_OTC", locked_color="bearish", payout=89, timeframe_seconds=60,
+        expiration_seconds=60, now=1000.0
     )
     assert warning is not None
     assert warning.type == SignalType.WARNING
@@ -30,7 +29,8 @@ def test_warning_sent_once() -> None:
 
     # Другий виклик по тому самому інструменту, доки ситуація не розв'язана — має дати None
     duplicate = queue.on_series_reached_four(
-        instrument="EURUSD_OTC", locked_color="bearish", payout=89, timeframe_seconds=60, now=1005.0
+        instrument="EURUSD_OTC", locked_color="bearish", payout=89, timeframe_seconds=60,
+        expiration_seconds=60, now=1005.0
     )
     assert duplicate is None
     print("✅ Дублікат попередження заблоковано (п.12)")
@@ -38,7 +38,7 @@ def test_warning_sent_once() -> None:
 
 def test_confirmation_before_deadline_returns_none() -> None:
     queue = SignalQueue(confirmation_delay_seconds=30)
-    queue.on_series_reached_four("EURUSD_OTC", "bearish", 89, 60, now=1000.0)
+    queue.on_series_reached_four("EURUSD_OTC", "bearish", 89, 60, expiration_seconds=60, now=1000.0)
 
     result = queue.check_confirmation("EURUSD_OTC", make_candle(is_bearish=True, ts=1010.0), now=1010.0)
     assert result is None
@@ -47,7 +47,7 @@ def test_confirmation_before_deadline_returns_none() -> None:
 
 def test_confirmation_success_gives_put() -> None:
     queue = SignalQueue(confirmation_delay_seconds=30)
-    queue.on_series_reached_four("EURUSD_OTC", "bearish", 89, 60, now=1000.0)
+    queue.on_series_reached_four("EURUSD_OTC", "bearish", 89, 60, expiration_seconds=60, now=1000.0)
 
     # Час підтвердження настав (1000 + 30 = 1030), 5-та свічка досі червона
     result = queue.check_confirmation("EURUSD_OTC", make_candle(is_bearish=True, ts=1030.0), now=1030.0)
@@ -63,7 +63,7 @@ def test_confirmation_success_gives_put() -> None:
 
 def test_confirmation_reversed_cancels_silently() -> None:
     queue = SignalQueue(confirmation_delay_seconds=30)
-    queue.on_series_reached_four("EURUSD_OTC", "bearish", 89, 60, now=1000.0)
+    queue.on_series_reached_four("EURUSD_OTC", "bearish", 89, 60, expiration_seconds=60, now=1000.0)
 
     # 5-та свічка розвернулась (стала зеленою, хоча очікували червону)
     result = queue.check_confirmation("EURUSD_OTC", make_candle(is_bearish=False, ts=1030.0), now=1030.0)
@@ -77,19 +77,19 @@ def test_confirmation_reversed_cancels_silently() -> None:
 
 def test_new_warning_after_resolution() -> None:
     queue = SignalQueue(confirmation_delay_seconds=30)
-    queue.on_series_reached_four("EURUSD_OTC", "bearish", 89, 60, now=1000.0)
+    queue.on_series_reached_four("EURUSD_OTC", "bearish", 89, 60, expiration_seconds=60, now=1000.0)
     queue.check_confirmation("EURUSD_OTC", make_candle(is_bearish=True, ts=1030.0), now=1030.0)
 
     # Нова серія сформувалась пізніше — має дозволити нове попередження
-    new_warning = queue.on_series_reached_four("EURUSD_OTC", "bearish", 91, 60, now=2000.0)
+    new_warning = queue.on_series_reached_four("EURUSD_OTC", "bearish", 91, 60, expiration_seconds=60, now=2000.0)
     assert new_warning is not None
     print("✅ Після завершення попередньої ситуації нове попередження дозволене")
 
 
 def test_independent_instruments() -> None:
     queue = SignalQueue(confirmation_delay_seconds=30)
-    w1 = queue.on_series_reached_four("EURUSD_OTC", "bearish", 89, 60, now=1000.0)
-    w2 = queue.on_series_reached_four("GBPUSD_OTC", "bullish", 90, 60, now=1000.0)
+    w1 = queue.on_series_reached_four("EURUSD_OTC", "bearish", 89, 60, expiration_seconds=60, now=1000.0)
+    w2 = queue.on_series_reached_four("GBPUSD_OTC", "bullish", 90, 60, expiration_seconds=60, now=1000.0)
     assert w1 is not None and w2 is not None
     print("✅ Різні інструменти обробляються незалежно один від одного")
 

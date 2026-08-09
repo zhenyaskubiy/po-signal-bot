@@ -18,6 +18,7 @@ from typing import Awaitable, Callable, Optional
 
 from core.candle import Candle
 from core.candle_counter import CandleCounter
+from core.runtime_settings import RuntimeSettingsStore
 from core.signal_queue import SignalEvent, SignalQueue
 from core.supertrend import SupertrendCalculator
 
@@ -37,11 +38,13 @@ class InstrumentEngine:
         supertrend_multiplier: float,
         timeframe_seconds: int,
         min_payout_percent: float,
+        runtime_settings: RuntimeSettingsStore,
     ):
         self.instrument = instrument
         self.signal_queue = signal_queue
         self.timeframe_seconds = timeframe_seconds
         self.min_payout_percent = min_payout_percent
+        self.runtime_settings = runtime_settings
 
         self.supertrend = SupertrendCalculator(atr_period=supertrend_atr_period, multiplier=supertrend_multiplier)
         self.candle_counter = CandleCounter()
@@ -50,7 +53,8 @@ class InstrumentEngine:
     def process_closed_candle(self, candle: Candle, payout: float, now: Optional[float] = None) -> Optional[SignalEvent]:
         """
         Обробляє щойно закриту свічку. Повертає попередження (🟡), якщо
-        серія антитрендових свічок щойно (саме на цій свічці) досягла 4.
+        серія антитрендових свічок щойно (саме на цій свічці) досягла
+        потрібної кількості (за замовчуванням 4, налаштовується через /settings).
 
         now — необов'язковий unix-час (для тестів на симульованому часі);
         за замовчуванням береться реальний поточний час.
@@ -58,15 +62,19 @@ class InstrumentEngine:
         st_result = self.supertrend.update(candle)
         state = self.candle_counter.update(candle, st_result.direction, st_result.changed)
 
+        settings = self.runtime_settings.get()
+        required = settings.required_anti_trend_candles
+
         warning = None
-        just_reached_four = state.active and state.count == 4 and self._prev_count != 4
-        if just_reached_four:
+        just_reached_required = state.active and state.count == required and self._prev_count != required
+        if just_reached_required:
             if payout >= self.min_payout_percent:
                 warning = self.signal_queue.on_series_reached_four(
                     instrument=self.instrument,
                     locked_color=state.locked_color,
                     payout=payout,
                     timeframe_seconds=self.timeframe_seconds,
+                    expiration_seconds=settings.expiration_seconds,
                     now=now,
                 )
             else:
