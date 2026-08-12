@@ -6,8 +6,9 @@
      кнопки для зміни часу експірації та кількості антитрендових свічок
      "на льоту", без редагування конфігурації чи перезапуску бота;
   2. Цикл аналізу ринку по кожному інструменту (Supertrend → підрахунок
-     антитрендових свічок → черга сигналів), поки що на СИМУЛЬОВАНИХ
-     даних (data/simulator.py).
+     антитрендових свічок → черга сигналів) — на симульованих АБО
+     реальних даних Pocket Option, залежно від config/settings.yaml
+     (data_source: "simulator" / "pocket_option").
 
 Сигнали надсилаються в Telegram-чат, вказаний у config/settings.yaml
 (telegram.chat_id).
@@ -41,9 +42,10 @@ from telegram.ext import (
 )
 
 from config.loader import load_config
-from core.engine import InstrumentEngine, run_with_feed
+from core.engine import InstrumentEngine, run_with_feed, run_with_live_feed
 from core.runtime_settings import RuntimeSettingsStore
 from core.signal_queue import SignalEvent, SignalQueue
+from data.pocket_option_feed import PocketOptionFeed
 from data.simulator import SimulatedDataFeed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -171,7 +173,15 @@ async def main() -> None:
         except Exception as e:
             logger.error("Не вдалося надіслати сигнал у Telegram: %s", e)
 
-    feed = SimulatedDataFeed(instruments=cfg.instruments)
+    if cfg.data_source == "pocket_option":
+        feed = PocketOptionFeed(ssid=cfg.pocket_option.ssid, is_demo=cfg.pocket_option.is_demo)
+        await feed.connect()
+        run_loop = run_with_live_feed
+        print("⚠️  РЕЖИМ РЕАЛЬНИХ ДАНИХ — сигнали базуються на живому ринку Pocket Option.")
+    else:
+        feed = SimulatedDataFeed(instruments=cfg.instruments)
+        run_loop = run_with_feed
+
     signal_queue = SignalQueue(confirmation_delay_seconds=cfg.confirmation_delay_seconds)
 
     engines = [
@@ -187,12 +197,14 @@ async def main() -> None:
         for instrument in cfg.instruments
     ]
 
-    print(f"✅ Бот запущений. Аналізую {len(engines)} інструмент(ів) на симульованих даних.")
+    print(f"✅ Бот запущений. Аналізую {len(engines)} інструмент(ів) — джерело: {cfg.data_source}.")
     print("У Telegram: /start — перевірка зв'язку, /settings — змінити параметри. Ctrl+C — вихід.\n")
 
     try:
-        await asyncio.gather(*(run_with_feed(engine, feed, on_signal) for engine in engines))
+        await asyncio.gather(*(run_loop(engine, feed, on_signal) for engine in engines))
     finally:
+        if cfg.data_source == "pocket_option":
+            await feed.disconnect()
         await app.updater.stop()
         await app.stop()
         await app.shutdown()

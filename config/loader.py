@@ -38,6 +38,12 @@ class LoggingConfig:
 
 
 @dataclass
+class PocketOptionConfig:
+    ssid: str = ""
+    is_demo: bool = True
+
+
+@dataclass
 class BotConfig:
     timeframe_seconds: int
     expiration_seconds: int
@@ -49,6 +55,7 @@ class BotConfig:
     telegram: TelegramConfig
     data_source: str
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    pocket_option: PocketOptionConfig = field(default_factory=PocketOptionConfig)
 
 
 class ConfigError(Exception):
@@ -66,6 +73,7 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> BotConfig:
         supertrend = SupertrendConfig(**raw["supertrend"])
         telegram = TelegramConfig(**raw["telegram"])
         logging_cfg = LoggingConfig(**raw.get("logging", {}))
+        pocket_option_cfg = PocketOptionConfig(**raw.get("pocket_option", {}))
 
         instruments = raw["instruments"]
         if not instruments:
@@ -82,6 +90,7 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> BotConfig:
             telegram=telegram,
             data_source=raw.get("data_source", "simulator"),
             logging=logging_cfg,
+            pocket_option=pocket_option_cfg,
         )
     except KeyError as e:
         raise ConfigError(f"У конфігурації відсутнє обов'язкове поле: {e}") from e
@@ -93,10 +102,6 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> BotConfig:
 def _validate(cfg: BotConfig) -> None:
     if cfg.timeframe_seconds <= 0:
         raise ConfigError("timeframe_seconds повинен бути додатним числом.")
-    if cfg.expiration_seconds <= 0:
-        raise ConfigError("expiration_seconds повинен бути додатним числом.")
-    if cfg.required_anti_trend_candles <= 0:
-        raise ConfigError("required_anti_trend_candles повинен бути додатним числом.")
     if cfg.supertrend.atr_period <= 0:
         raise ConfigError("supertrend.atr_period повинен бути додатним числом.")
     if cfg.supertrend.multiplier <= 0:
@@ -107,6 +112,10 @@ def _validate(cfg: BotConfig) -> None:
         raise ConfigError("confirmation_delay_seconds повинен бути додатним числом.")
     if cfg.data_source not in ("simulator", "pocket_option"):
         raise ConfigError("data_source повинен бути 'simulator' або 'pocket_option'.")
+    if cfg.data_source == "pocket_option" and not cfg.pocket_option.ssid:
+        raise ConfigError(
+            "data_source='pocket_option', але pocket_option.ssid порожній — впишіть sessionToken."
+        )
 
 
 if __name__ == "__main__":

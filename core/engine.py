@@ -1,20 +1,29 @@
 """
-Об'єднує Supertrend, підрахунок антитрендових свічок і чергу сигналів
-в один робочий цикл для ОДНОГО інструменту.
+Основний двигун аналізу одного інструменту.
 
-Логіка прийняття рішень (process_closed_candle / process_confirmation)
-навмисно відокремлена від реального часу (asyncio) — це дозволяє тестувати
-її напряму, підставляючи свічки вручну, без очікування реальних секунд.
-Асинхронна частина (run_with_feed) — це вже "жива" обгортка, яка тягне
-дані з джерела (симулятора чи, пізніше, реального Pocket Option) в
-реальному часі.
+Логіка:
+
+1. Отримуємо тільки ЗАКРИТІ свічки.
+2. Закриті свічки послідовно передаємо:
+       Candle -> Supertrend -> CandleCounter
+3. Коли серія антитрендових свічок досягає потрібної кількості,
+   створюємо WARNING через SignalQueue.
+4. Після WARNING окремо перевіряємо ПОТОЧНУ формуючу свічку.
+5. Формуюча свічка НЕ потрапляє в Supertrend/CandleCounter.
+6. Якщо через confirmation_delay_seconds вона все ще антитрендова,
+   SignalQueue повертає CALL/PUT.
+7. Якщо вона розвернулась — сигнал скасовується.
+
+Для simulator використовується run_with_feed().
+Для Pocket Option — run_with_live_feed().
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable, Optional
+import time
+from typing import Awaitable, Callable, Optional, Protocol
 
 from core.candle import Candle
 from core.candle_counter import CandleCounter
@@ -24,99 +33,453 @@ from core.supertrend import SupertrendCalculator
 
 logger = logging.getLogger(__name__)
 
-OnSignal = Callable[[SignalEvent], Awaitable[None]]
 
+# ============================================================
+# Типи
+# ============================================================
+
+SignalCallback = Callable[[SignalEvent], Awaitable[None]]
+
+
+class CandleFeed(Protocol):
+    """
+    Мінімальний інтерфейс джерела свічок.
+
+    Симулятор може мати тільки get_latest_candle().
+    Реальний Pocket Option Feed додатково має:
+      - get_latest_closed_candle()
+      - get_current_forming_candle()
+    """
+
+    async def get_latest_candle(
+        self,
+        instrument: str,
+        timeframe_seconds: int,
+    ) -> Optional[Candle]:
+        ...
+
+
+# ============================================================
+# InstrumentEngine
+# ============================================================
 
 class InstrumentEngine:
-    """Веде повний цикл прийняття рішень для одного інструменту."""
+    """
+    Аналіз одного інструменту.
+
+    Для кожного інструменту створюється окремий екземпляр.
+    """
 
     def __init__(
         self,
         instrument: str,
         signal_queue: SignalQueue,
-        supertrend_atr_period: int,
-        supertrend_multiplier: float,
-        timeframe_seconds: int,
-        min_payout_percent: float,
-        runtime_settings: RuntimeSettingsStore,
+        supertrend_atr_period: int = 10,
+        supertrend_multiplier: float = 3.0,
+        timeframe_seconds: int = 60,
+        min_payout_percent: float = 0.0,
+        runtime_settings: Optional[RuntimeSettingsStore] = None,
     ):
         self.instrument = instrument
         self.signal_queue = signal_queue
+
         self.timeframe_seconds = timeframe_seconds
         self.min_payout_percent = min_payout_percent
+
         self.runtime_settings = runtime_settings
 
-        self.supertrend = SupertrendCalculator(atr_period=supertrend_atr_period, multiplier=supertrend_multiplier)
+        # Індикатор Supertrend.
+        self.supertrend = SupertrendCalculator(
+            atr_period=supertrend_atr_period,
+            multiplier=supertrend_multiplier,
+        )
+
+        # Лічильник антитрендових свічок.
         self.candle_counter = CandleCounter()
-        self._prev_count = 0
 
-    def process_closed_candle(self, candle: Candle, payout: float, now: Optional[float] = None) -> Optional[SignalEvent]:
+        # Остання ЗАКРИТА свічка, яку ми вже обробили.
+        self._last_processed_timestamp: Optional[float] = None
+
+        # Останній відомий Supertrend.
+        self._last_supertrend_direction: Optional[str] = None
+
+        # Для діагностики.
+        self._processed_candles = 0
+
+    # --------------------------------------------------------
+    # Налаштування
+    # --------------------------------------------------------
+
+    def _required_candles(self) -> int:
         """
-        Обробляє щойно закриту свічку. Повертає попередження (🟡), якщо
-        серія антитрендових свічок щойно (саме на цій свічці) досягла
-        потрібної кількості (за замовчуванням 4, налаштовується через /settings).
+        Кількість антитрендових свічок, необхідна для WARNING.
 
-        now — необов'язковий unix-час (для тестів на симульованому часі);
-        за замовчуванням береться реальний поточний час.
+        Якщо RuntimeSettingsStore доступний — беремо значення
+        звідти, щоб його можна було змінювати через Telegram
+        без перезапуску.
         """
-        st_result = self.supertrend.update(candle)
-        state = self.candle_counter.update(candle, st_result.direction, st_result.changed)
 
-        settings = self.runtime_settings.get()
-        required = settings.required_anti_trend_candles
+        if self.runtime_settings is not None:
+            return self.runtime_settings.get().required_anti_trend_candles
 
-        warning = None
-        just_reached_required = state.active and state.count == required and self._prev_count != required
-        if just_reached_required:
-            if payout >= self.min_payout_percent:
-                warning = self.signal_queue.on_series_reached_four(
-                    instrument=self.instrument,
-                    locked_color=state.locked_color,
-                    payout=payout,
-                    timeframe_seconds=self.timeframe_seconds,
-                    expiration_seconds=settings.expiration_seconds,
-                    now=now,
+        # Значення за замовчуванням.
+        return 4
+
+    def _expiration_seconds(self) -> int:
+        """
+        Поточний час експірації.
+        """
+
+        if self.runtime_settings is not None:
+            return self.runtime_settings.get().expiration_seconds
+
+        return self.timeframe_seconds
+
+    # --------------------------------------------------------
+    # Обробка однієї ЗАКРИТОЇ свічки
+    # --------------------------------------------------------
+
+    async def process_closed_candle(
+        self,
+        candle: Candle,
+        payout: float,
+        on_signal: SignalCallback,
+    ) -> None:
+        """
+        Обробляє одну повністю закриту свічку.
+
+        ВАЖЛИВО:
+        сюди не повинна потрапляти формуюча свічка.
+        """
+
+        timestamp = float(candle.timestamp)
+
+        # ----------------------------------------------------
+        # Захист від повторної обробки
+        # ----------------------------------------------------
+
+        if self._last_processed_timestamp is not None:
+            if timestamp <= self._last_processed_timestamp:
+                return
+
+        self._last_processed_timestamp = timestamp
+
+        # ----------------------------------------------------
+        # Supertrend
+        # ----------------------------------------------------
+
+        supertrend_result = self.supertrend.update(candle)
+
+        current_direction = supertrend_result.direction
+
+        logger.debug(
+            "%s | Supertrend=%s | changed=%s | value=%.5f",
+            self.instrument,
+            current_direction,
+            supertrend_result.changed,
+            supertrend_result.value,
+        )
+
+        # ----------------------------------------------------
+        # CandleCounter
+        # ----------------------------------------------------
+
+        previous_count = self.candle_counter.state.count
+
+        state = self.candle_counter.update(
+            candle=candle,
+            supertrend_direction=current_direction,
+            supertrend_changed=supertrend_result.changed,
+        )
+
+        self._last_supertrend_direction = current_direction
+        self._processed_candles += 1
+
+        logger.info(
+            "%s: Supertrend=%s | антитренд=%s | серія=%d",
+            self.instrument,
+            current_direction,
+            state.locked_color,
+            state.count,
+        )
+
+        # ----------------------------------------------------
+        # Перевіряємо досягнення потрібної кількості
+        # ----------------------------------------------------
+
+        required = self._required_candles()
+
+        # Нам потрібен саме момент переходу:
+        #
+        # було 3
+        # стало 4
+        #
+        # А не кожен наступний update зі значенням 4+.
+        if previous_count < required <= state.count:
+
+            # ------------------------------------------------
+            # Перевірка payout
+            # ------------------------------------------------
+
+            if payout < self.min_payout_percent:
+                logger.info(
+                    "%s: серія досягла %d, але payout %.2f%% "
+                    "нижче мінімального %.2f%% — сигнал не створюємо.",
+                    self.instrument,
+                    state.count,
+                    payout,
+                    self.min_payout_percent,
                 )
-            else:
-                logger.info("%s: виплата %.1f%% нижче мінімальної — сигнал пропущено", self.instrument, payout)
+                return
 
-        self._prev_count = state.count if state.active else 0
-        return warning
+            if state.locked_color is None:
+                logger.warning(
+                    "%s: серія досягла %d, але locked_color=None.",
+                    self.instrument,
+                    state.count,
+                )
+                return
 
-    def process_confirmation(self, forming_candle: Candle, now: Optional[float] = None) -> Optional[SignalEvent]:
-        """Перевіряє 5-ту (ще не закриту) свічку — повертає основний сигнал або None."""
-        return self.signal_queue.check_confirmation(self.instrument, forming_candle, now=now)
+            # ------------------------------------------------
+            # Створюємо WARNING
+            # ------------------------------------------------
 
+            warning = self.signal_queue.on_series_reached_four(
+                instrument=self.instrument,
+                locked_color=state.locked_color,
+                payout=payout,
+                timeframe_seconds=self.timeframe_seconds,
+                expiration_seconds=self._expiration_seconds(),
+            )
+
+            if warning is not None:
+                logger.info(
+                    "%s: 🟡 Створено WARNING | серія=%d | колір=%s",
+                    self.instrument,
+                    state.count,
+                    state.locked_color,
+                )
+
+                await on_signal(warning)
+
+    # --------------------------------------------------------
+    # Перевірка поточної формуючої свічки
+    # --------------------------------------------------------
+
+    async def check_forming_candle(
+        self,
+        forming_candle: Optional[Candle],
+        on_signal: SignalCallback,
+    ) -> None:
+        """
+        Перевіряє поточну формуючу свічку.
+
+        Вона НЕ передається в:
+          - Supertrend
+          - CandleCounter
+
+        Вона використовується тільки для SignalQueue,
+        яка вирішує, чи підтвердився сигнал.
+        """
+
+        if forming_candle is None:
+            return
+
+        if not self.signal_queue.has_pending(self.instrument):
+            return
+
+        event = self.signal_queue.check_confirmation(
+            instrument=self.instrument,
+            forming_candle=forming_candle,
+        )
+
+        if event is None:
+            return
+
+        logger.info(
+            "%s: 🚨 ПІДТВЕРДЖЕНО %s",
+            self.instrument,
+            event.type.value,
+        )
+
+        await on_signal(event)
+
+    # --------------------------------------------------------
+    # Повна обробка реального Feed
+    # --------------------------------------------------------
+
+    async def process_live(
+        self,
+        feed,
+        on_signal: SignalCallback,
+        payout: float,
+    ) -> None:
+        """
+        Один цикл аналізу для Pocket Option.
+
+        1. Беремо останню закриту свічку.
+        2. Якщо вона нова — обробляємо її.
+        3. Беремо формуючу свічку.
+        4. Перевіряємо pending confirmation.
+        """
+
+        # ----------------------------------------------------
+        # 1. ЗАКРИТА свічка
+        # ----------------------------------------------------
+
+        closed_candle = await feed.get_latest_closed_candle(
+            instrument=self.instrument,
+            timeframe_seconds=self.timeframe_seconds,
+        )
+
+        if closed_candle is not None:
+
+            await self.process_closed_candle(
+                candle=closed_candle,
+                payout=payout,
+                on_signal=on_signal,
+            )
+
+        # ----------------------------------------------------
+        # 2. ФОРМУЮЧА свічка
+        # ----------------------------------------------------
+
+        forming_candle = await feed.get_current_forming_candle(
+            instrument=self.instrument,
+            timeframe_seconds=self.timeframe_seconds,
+        )
+
+        await self.check_forming_candle(
+            forming_candle=forming_candle,
+            on_signal=on_signal,
+        )
+
+    # --------------------------------------------------------
+    # Повна обробка симулятора
+    # --------------------------------------------------------
+
+    async def process_simulated(
+        self,
+        feed,
+        on_signal: SignalCallback,
+        payout: float = 100.0,
+    ) -> None:
+        """
+        Обробка для SimulatedDataFeed.
+
+        Симулятор повертає свічки як послідовність закритих свічок,
+        тому вони одразу передаються в process_closed_candle().
+        """
+
+        candle = await feed.get_latest_candle(
+            instrument=self.instrument,
+            timeframe_seconds=self.timeframe_seconds,
+        )
+
+        if candle is None:
+            return
+
+        await self.process_closed_candle(
+            candle=candle,
+            payout=payout,
+            on_signal=on_signal,
+        )
+
+
+# ============================================================
+# Реальний Pocket Option
+# ============================================================
+
+async def run_with_live_feed(
+    engine: InstrumentEngine,
+    feed,
+    on_signal: SignalCallback,
+) -> None:
+    """
+    Нескінченний цикл аналізу одного інструменту
+    через реальний Pocket Option Feed.
+
+    Кожен InstrumentEngine працює незалежно.
+    main.py запускає кілька таких корутин через asyncio.gather().
+    """
+
+    logger.info(
+        "%s: запущено live-аналіз | timeframe=%s сек",
+        engine.instrument,
+        engine.timeframe_seconds,
+    )
+
+    while True:
+        try:
+            payout = feed.get_payout(engine.instrument)
+
+            await engine.process_live(
+                feed=feed,
+                on_signal=on_signal,
+                payout=payout,
+            )
+
+        except asyncio.CancelledError:
+            logger.info(
+                "%s: live-цикл скасовано.",
+                engine.instrument,
+            )
+            raise
+
+        except Exception:
+            logger.exception(
+                "%s: помилка live-циклу.",
+                engine.instrument,
+            )
+
+        # ----------------------------------------------------
+        # Не потрібно опитувати API сотні разів за секунду.
+        # 1 секунда достатня для confirmation.
+        # ----------------------------------------------------
+
+        await asyncio.sleep(1)
+
+
+# ============================================================
+# Симулятор
+# ============================================================
 
 async def run_with_feed(
     engine: InstrumentEngine,
-    feed,  # data.simulator.SimulatedDataFeed або майбутній реальний фід
-    on_signal: OnSignal,
+    feed,
+    on_signal: SignalCallback,
 ) -> None:
     """
-    "Жива" обгортка навколо InstrumentEngine: тягне дані з feed у реальному
-    часі, тікає ціну, закриває свічки по таймфрейму, і в потрібний момент
-    запускає перевірку підтвердження — все паралельно, не блокуючи інші
-    інструменти чи Telegram-бота.
+    Нескінченний цикл для SimulatedDataFeed.
     """
+
+    logger.info(
+        "%s: запущено simulation-аналіз | timeframe=%s сек",
+        engine.instrument,
+        engine.timeframe_seconds,
+    )
+
     while True:
-        for _ in range(engine.timeframe_seconds):
-            feed.tick(engine.instrument)
-            await asyncio.sleep(1)
+        try:
+            payout = 100.0
 
-        candle = feed.close_candle(engine.instrument)
-        payout = feed.get_payout(engine.instrument)
-        warning = engine.process_closed_candle(candle, payout)
+            await engine.process_simulated(
+                feed=feed,
+                on_signal=on_signal,
+                payout=payout,
+            )
 
-        if warning:
-            await on_signal(warning)
-            asyncio.create_task(_confirm_later(engine, feed, on_signal))
+        except asyncio.CancelledError:
+            logger.info(
+                "%s: simulation-цикл скасовано.",
+                engine.instrument,
+            )
+            raise
 
+        except Exception:
+            logger.exception(
+                "%s: помилка simulation-циклу.",
+                engine.instrument,
+            )
 
-async def _confirm_later(engine: InstrumentEngine, feed, on_signal: OnSignal) -> None:
-    delay = engine.signal_queue.confirmation_delay_seconds
-    await asyncio.sleep(delay)
-    forming = feed.current_forming_candle(engine.instrument)
-    result = engine.process_confirmation(forming)
-    if result:
-        await on_signal(result)
+        await asyncio.sleep(1)
