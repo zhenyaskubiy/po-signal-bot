@@ -96,7 +96,7 @@ class SignalQueue:
             "🟡 Попередження\n"
             f"Інструмент: {instrument}\n"
             f"Напрямок: {direction_label}\n"
-            f"Виплата: {payout}%\n"
+            #f"Виплата: {payout}%\n"
             f"Таймфрейм: {timeframe_seconds} сек\n"
             f"Експірація: {expiration_seconds} сек\n"
             "Закрилися 4 антитрендові свічки. Очікуємо підтвердження."
@@ -145,7 +145,7 @@ class SignalQueue:
         message = (
             f"{emoji} {signal_type.value}\n"
             f"Інструмент: {instrument}\n"
-            f"Виплата: {pending.payout}%\n"
+            #f"Виплата: {pending.payout}%\n"
             f"Таймфрейм: {pending.timeframe_seconds} сек\n"
             f"Експірація: {pending.expiration_seconds} сек"
         )
