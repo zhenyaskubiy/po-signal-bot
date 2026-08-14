@@ -56,7 +56,32 @@ class PocketOptionFeed:
         self._last_closed_timestamp: dict[str, float] = {}
         self._last_forming_timestamp: dict[str, float] = {}
         self._last_latest_timestamp: dict[str, float] = {}
+        
+# ============================================================
+# LIVE STREAM
+# ============================================================
 
+    async def _on_stream_update(
+        self,
+        data,
+    ) -> None:
+
+        if "_placeholder" in data:
+            return
+
+        asset = data.get("asset")
+        ticks = data.get("data")
+
+        if not asset or not ticks:
+            return
+
+        price = ticks[-1][1]
+
+        logger.info(
+            "📈 %s | price %.5f",
+            asset,
+            price
+        )
     # ============================================================
     # CONNECT
     # ============================================================
@@ -74,6 +99,11 @@ class PocketOptionFeed:
             enable_logging=False,
         )
 
+        self._client.add_event_callback(
+                    "stream_update",
+                    self._on_stream_update
+                )
+
         connected = await self._client.connect()
 
         if not connected:
@@ -85,8 +115,7 @@ class PocketOptionFeed:
         balance = await self._client.get_balance()
 
         logger.info(
-            "✅ Підключено до Pocket Option | "
-            "Баланс: %s %s",
+            "✅ Підключено до Pocket Option | Баланс: %s %s",
             balance.balance,
             balance.currency,
         )
@@ -275,6 +304,12 @@ class PocketOptionFeed:
             )
 
             return []
+        
+        logger.info(
+            "RAW CANDLES %s: %s",
+            instrument,
+            candles[-3:]
+        )
 
         return candles
 
