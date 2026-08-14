@@ -1,679 +1,186 @@
 """
 Реальне підключення до Pocket Option через pocketoptionapi-async.
 
-Головне правило:
+⚠️ ВАЖЛИВО (підтверджено діагностикою 15.08):
+get_candles() у цій бібліотеці повертає ЗАМОРОЖЕНИЙ кеш — однакові дані
+щоразу, незалежно від того, скільки реального часу пройшло. Тому свічки
+для реального аналізу БІЛЬШЕ НЕ БЕРУТЬСЯ звідти.
 
-    candles[-1] -> НАЙСВІЖІША / формуюча свічка
-    candles[-2] -> остання повністю ЗАКРИТА свічка
+Натомість свічки будуються самостійно з живого потоку тіків
+(add_event_callback("stream_update", ...)), який підтверджено ДІЙСНО
+живий — ціни в ньому змінюються щосекунди.
 
-Формуюча свічка:
-    - НЕ передається в Supertrend;
-    - НЕ передається в CandleCounter;
-    - використовується тільки для confirmation.
-
-Закрита свічка:
-    - передається в InstrumentEngine;
-    - використовується для Supertrend;
-    - використовується для CandleCounter.
+get_candles() лишається тільки для одноразового "розігріву" історії
+при підключенні (щоб Supertrend одразу мав дані для ATR), а не для
+відстеження нових свічок у реальному часі.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-import time
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
 from pocketoptionapi_async import AsyncPocketOptionClient
 
 from core.candle import Candle
-
 
 logger = logging.getLogger(__name__)
 
 
 class PocketOptionFeed:
-    
-    def __init__(
-        self,
-        ssid: str,
-        is_demo: bool = True,
-    ):
+    def __init__(self, ssid: str, is_demo: bool = True, timeframe_seconds: int = 60):
         self.ssid = ssid
         self.is_demo = is_demo
+        self.timeframe_seconds = timeframe_seconds
 
         self._client: Optional[AsyncPocketOptionClient] = None
+        self._payouts: Dict[str, float] = {}
 
-        # --------------------------------------------------------
-        # Payout
-        # --------------------------------------------------------
+        # Свічка, яка зараз "будується" з живих тіків — по одній на інструмент.
+        self._forming: Dict[str, Candle] = {}
+        # Черга вже завершених (закритих) свічок, які ще не забрав engine.
+        self._closed_queue: Dict[str, List[Candle]] = {}
 
-        self._payouts: dict[str, float] = {}
+        self._last_logged_price_ts: Dict[str, float] = {}
 
-        # --------------------------------------------------------
-        # Діагностика / захист від дублювання логів
-        # --------------------------------------------------------
+    # ============================================================
+    # LIVE STREAM — тут відбувається вся реальна робота
+    # ============================================================
 
-        self._last_closed_timestamp: dict[str, float] = {}
-        self._last_forming_timestamp: dict[str, float] = {}
-        self._last_latest_timestamp: dict[str, float] = {}
-        
-# ============================================================
-# LIVE STREAM
-# ============================================================
-
-    async def _on_stream_update(
-        self,
-        data,
-    ) -> None:
-
-        if "_placeholder" in data:
+    async def _on_stream_update(self, data) -> None:
+        if not isinstance(data, dict) or "_placeholder" in data:
             return
 
         asset = data.get("asset")
         ticks = data.get("data")
-
         if not asset or not ticks:
             return
 
-        price = ticks[-1][1]
+        # Обробляємо ВСІ тіки в пачці (не тільки останній) — щоб не пропустити
+        # момент переходу через межу хвилини, якщо кілька тіків прийшли разом.
+        for tick in ticks:
+            try:
+                tick_ts = float(tick[0])
+                price = float(tick[1])
+            except (TypeError, ValueError, IndexError):
+                continue
 
-        logger.info(
-            "📈 %s | price %.5f",
-            asset,
-            price
-        )
+            self._absorb_tick(asset, tick_ts, price)
+
+        self._last_logged_price_ts[asset] = float(ticks[-1][0])
+
+    def _absorb_tick(self, asset: str, tick_ts: float, price: float) -> None:
+        bucket_start = int(tick_ts // self.timeframe_seconds * self.timeframe_seconds)
+        current = self._forming.get(asset)
+
+        if current is None:
+            # Перший тік для цього інструменту — просто починаємо нову свічку
+            self._forming[asset] = Candle(
+                open=price, high=price, low=price, close=price, timestamp=bucket_start
+            )
+            return
+
+        if current.timestamp == bucket_start:
+            # Той самий часовий інтервал — оновлюємо high/low/close поточної свічки
+            self._forming[asset] = Candle(
+                open=current.open,
+                high=max(current.high, price),
+                low=min(current.low, price),
+                close=price,
+                timestamp=bucket_start,
+            )
+            return
+
+        if bucket_start > current.timestamp:
+            # Почалась нова хвилина — попередня свічка щойно ЗАКРИЛАСЬ
+            self._closed_queue.setdefault(asset, []).append(current)
+            self._forming[asset] = Candle(
+                open=price, high=price, low=price, close=price, timestamp=bucket_start
+            )
+            logger.info(
+                "🔒 Закрито свічку з живого потоку | %s | %s | O:%.5f H:%.5f L:%.5f C:%.5f",
+                asset,
+                self._format_timestamp(current.timestamp),
+                current.open, current.high, current.low, current.close,
+            )
+        # bucket_start < current.timestamp — застарілий тік, ігноруємо
+
     # ============================================================
     # CONNECT
     # ============================================================
 
-    async def connect(self) -> None:
-        """
-        Підключення до Pocket Option.
-        """
-
+    async def connect(self, instruments: Optional[List[str]] = None) -> None:
         logger.info("🔌 Підключення до Pocket Option...")
 
-        self._client = AsyncPocketOptionClient(
-            self.ssid,
-            is_demo=self.is_demo,
-            enable_logging=False,
-        )
-
-        self._client.add_event_callback(
-                    "stream_update",
-                    self._on_stream_update
-                )
+        self._client = AsyncPocketOptionClient(self.ssid, is_demo=self.is_demo, enable_logging=False)
+        self._client.add_event_callback("stream_update", self._on_stream_update)
 
         connected = await self._client.connect()
-
         if not connected:
-            raise RuntimeError(
-                "Не вдалося підключитися до Pocket Option. "
-                "Перевір SSID."
-            )
+            raise RuntimeError("Не вдалося підключитися до Pocket Option. Перевір SSID.")
 
         balance = await self._client.get_balance()
+        logger.info("✅ Підключено до Pocket Option | Баланс: %s %s", balance.balance, balance.currency)
 
-        logger.info(
-            "✅ Підключено до Pocket Option | Баланс: %s %s",
-            balance.balance,
-            balance.currency,
-        )
+        # Обов'язково викликаємо get_candles для кожного активу, 
+        # щоб сервер Pocket Option відкрив підписку на WebSocket-потік цього символу
+        if instruments:
+            for instrument in instruments:
+                try:
+                    await self._client.get_candles(asset=instrument, timeframe=self.timeframe_seconds, count=10)
+                    logger.info("📡 Активовано потік для інструменту: %s", instrument)
+                except Exception as e:
+                    logger.error("❌ Помилка активації потоку для %s: %s", instrument, e)
 
     # ============================================================
-    # PAYOUT
+    # PAYOUT (відомий ліміт бібліотеки — див. попередні повідомлення)
     # ============================================================
 
     async def refresh_payouts(self) -> None:
-        """
-        Поки що реальний payout не отримуємо.
-
-        Значення 100.0 нижче — лише fallback для роботи
-        логіки сигналів.
-        """
-
-        logger.warning(
-            "⚠️ Реальний payout поки недоступний "
-            "через поточну версію pocketoptionapi_async."
-        )
-
+        logger.warning("⚠️ Реальний payout недоступний через цю бібліотеку — використовується 100%% для всіх.")
         self._payouts = {}
 
     def get_payout(self, instrument: str) -> float:
-        """
-        Повертає payout.
-
-        Якщо реальний payout не отриманий,
-        використовується 100%.
-        """
-
-        return self._payouts.get(
-            instrument,
-            100.0,
-        )
+        return self._payouts.get(instrument, 100.0)
 
     # ============================================================
-    # TIMESTAMP
+    # ІНТЕРФЕЙС ДЛЯ InstrumentEngine
     # ============================================================
-    @staticmethod
-    def _timestamp_to_float(
-        timestamp,
-    ) -> Optional[float]:
 
-        if timestamp is None:
+    async def get_latest_closed_candle(self, instrument: str, timeframe_seconds: int) -> Optional[Candle]:
+        queue = self._closed_queue.get(instrument)
+        if not queue:
             return None
+        return queue.pop(0)  # FIFO — не пропускаємо жодної закритої свічки
 
-        try:
+    async def get_current_forming_candle(self, instrument: str, timeframe_seconds: int) -> Optional[Candle]:
+        return self._forming.get(instrument)
 
-            # datetime
-            if hasattr(timestamp, "timestamp"):
-                return float(timestamp.timestamp())
-
-            # int / float / numeric string
-            return float(timestamp)
-
-        except (
-            TypeError,
-            ValueError,
-            OverflowError,
-        ):
-            return None
-    # ============================================================
-    # RAW -> Candle
-    # ============================================================
-
-    @staticmethod
-    def _to_candle(
-        raw_candle,
-    ) -> Optional[Candle]:
-        """
-        Перетворює raw-свічку API у нашу Candle.
-
-        Некоректні свічки відкидаються.
-        """
-
-        # --------------------------------------------------------
-        # Timestamp
-        # --------------------------------------------------------
-
-        timestamp = PocketOptionFeed._timestamp_to_float(
-            getattr(
-                raw_candle,
-                "timestamp",
-                None,
-            )
-        )
-
-        if timestamp is None:
-            return None
-
-        # --------------------------------------------------------
-        # OHLC
-        # --------------------------------------------------------
-
-        try:
-
-            open_price = float(
-                raw_candle.open
-            )
-
-            high_price = float(
-                raw_candle.high
-            )
-
-            low_price = float(
-                raw_candle.low
-            )
-
-            close_price = float(
-                raw_candle.close
-            )
-
-        except (
-            TypeError,
-            ValueError,
-            AttributeError,
-        ):
-            return None
-
-        # --------------------------------------------------------
-        # Перевірка OHLC
-        # --------------------------------------------------------
-
-        if high_price < max(
-            open_price,
-            close_price,
-        ):
-            logger.warning(
-                "⚠️ Відкинуто некоректну свічку: "
-                "high < open/close"
-            )
-            return None
-
-        if low_price > min(
-            open_price,
-            close_price,
-        ):
-            logger.warning(
-                "⚠️ Відкинуто некоректну свічку: "
-                "low > open/close"
-            )
-            return None
-
-        # --------------------------------------------------------
-        # Створюємо Candle
-        # --------------------------------------------------------
-
-        return Candle(
-            open=open_price,
-            high=high_price,
-            low=low_price,
-            close=close_price,
-            timestamp=timestamp,
-        )
+    async def get_latest_candle(self, instrument: str, timeframe_seconds: int) -> Optional[Candle]:
+        """Сумісність зі старим інтерфейсом — повертає тільки закриту."""
+        return await self.get_latest_closed_candle(instrument, timeframe_seconds)
 
     # ============================================================
-    # RAW CANDLES
-    # ============================================================
-
-    async def _get_raw_candles(
-        self,
-        instrument: str,
-        timeframe_seconds: int,
-    ):
-        """
-        Отримує історичні свічки з Pocket Option.
-        """
-
-        if self._client is None:
-            raise RuntimeError(
-                "Pocket Option client ще не підключений."
-            )
-
-        candles = await self._client.get_candles(
-            asset=instrument,
-            timeframe=timeframe_seconds,
-            count=100,
-        )
-
-        if not candles:
-
-            logger.warning(
-                "⚠️ %s: Pocket Option не повернув свічки.",
-                instrument,
-            )
-
-            return []
-        
-        logger.info(
-            "RAW CANDLES %s: %s",
-            instrument,
-            candles[-3:]
-        )
-
-        return candles
-
-    # ============================================================
-    # SORTED CANDLES
-    # ============================================================
-
-    async def _get_sorted_candles(
-        self,
-        instrument: str,
-        timeframe_seconds: int,
-    ) -> list[Candle]:
-        """
-        Отримує та нормалізує свічки.
-
-        Результат:
-
-            [найстаріша, ..., передостання, найновіша]
-
-        Тобто:
-
-            candles[-1] = найсвіжіша
-            candles[-2] = передостання
-        """
-
-        raw_candles = await self._get_raw_candles(
-            instrument=instrument,
-            timeframe_seconds=timeframe_seconds,
-        )
-
-        if not raw_candles:
-            return []
-
-        candles: list[Candle] = []
-
-        for raw_candle in raw_candles:
-
-            candle = self._to_candle(
-                raw_candle
-            )
-
-            if candle is not None:
-                candles.append(candle)
-
-        if not candles:
-
-            logger.warning(
-                "⚠️ %s: жодна свічка не пройшла "
-                "перевірку timestamp/OHLC.",
-                instrument,
-            )
-
-            return []
-
-        # --------------------------------------------------------
-        # КРИТИЧНО:
-        # завжди сортуємо за timestamp
-        # --------------------------------------------------------
-
-        candles.sort(
-            key=lambda candle: candle.timestamp
-        )
-
-        return candles
-
-    # ============================================================
-    # FORMAT TIMESTAMP
+    # УТИЛІТИ
     # ============================================================
 
     @staticmethod
     def _format_timestamp(timestamp: float) -> str:
         try:
-            return datetime.fromtimestamp(
-                timestamp,
-                tz=timezone.utc,
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             return "INVALID"
-    # ============================================================
-    # DIRECTION
-    # ============================================================
-
-    @staticmethod
-    def _direction(
-        candle: Candle,
-    ) -> str:
-
-        if candle.close > candle.open:
-            return "🟢 BULLISH"
-
-        if candle.close < candle.open:
-            return "🔴 BEARISH"
-
-        return "⚪ DOJI"
-
-    # ============================================================
-    # LOG LATEST
-    # ============================================================
-
-    def _log_latest_candle(
-        self,
-        instrument: str,
-        candle: Candle,
-    ) -> None:
-        """
-        Логує найсвіжішу свічку один раз.
-        """
-
-        previous = self._last_latest_timestamp.get(
-            instrument
-        )
-
-        if previous == candle.timestamp:
-            return
-
-        self._last_latest_timestamp[
-            instrument
-        ] = candle.timestamp
-
-        logger.info(
-            "🕯 НАЙСВІЖІША СВІЧКА | %s | %s\n"
-            "   Open:  %.5f\n"
-            "   High:  %.5f\n"
-            "   Low:   %.5f\n"
-            "   Close: %.5f\n"
-            "   Напрямок: %s\n"
-            "   timestamp: %.0f",
-            instrument,
-            self._format_timestamp(
-                candle.timestamp
-            ),
-            candle.open,
-            candle.high,
-            candle.low,
-            candle.close,
-            self._direction(candle),
-            candle.timestamp,
-        )
-
-    # ============================================================
-    # GET LATEST CLOSED CANDLE
-    # ============================================================
-
-    async def get_latest_closed_candle(
-        self,
-        instrument: str,
-        timeframe_seconds: int,
-    ) -> Optional[Candle]:
-        """
-        Повертає ОСТАННЮ ПОВНІСТЮ ЗАКРИТУ свічку.
-
-        Вважаємо:
-
-            candles[-1] -> формуюча
-            candles[-2] -> закрита
-
-        Формуюча свічка тут НІКОЛИ не повертається.
-        """
-
-        candles = await self._get_sorted_candles(
-            instrument=instrument,
-            timeframe_seconds=timeframe_seconds,
-        )
-
-        # --------------------------------------------------------
-        # Немає свічок
-        # --------------------------------------------------------
-
-        if not candles:
-            return None
-
-        # --------------------------------------------------------
-        # Найсвіжіша
-        # --------------------------------------------------------
-
-        latest = candles[-1]
-
-        self._log_latest_candle(
-            instrument=instrument,
-            candle=latest,
-        )
-
-        # --------------------------------------------------------
-        # Потрібні мінімум 2 свічки
-        # --------------------------------------------------------
-
-        if len(candles) < 2:
-
-            logger.warning(
-                "⚠️ %s: недостатньо свічок. "
-                "Потрібно мінімум 2.",
-                instrument,
-            )
-
-            return None
-
-        # --------------------------------------------------------
-        # Передостання = закрита
-        # --------------------------------------------------------
-
-        closed = candles[-2]
-
-        # --------------------------------------------------------
-        # Захист від повторної передачі
-        # --------------------------------------------------------
-
-        previous_timestamp = (
-            self._last_closed_timestamp.get(
-                instrument
-            )
-        )
-
-        if previous_timestamp == closed.timestamp:
-            return None
-
-        self._last_closed_timestamp[
-            instrument
-        ] = closed.timestamp
-
-        # --------------------------------------------------------
-        # Лог
-        # --------------------------------------------------------
-
-        logger.info(
-            "🔒 НОВА ЗАКРИТА СВІЧКА | %s | %s\n"
-            "   Open:  %.5f\n"
-            "   High:  %.5f\n"
-            "   Low:   %.5f\n"
-            "   Close: %.5f\n"
-            "   Напрямок: %s\n"
-            "   timestamp: %.0f",
-            instrument,
-            self._format_timestamp(
-                closed.timestamp
-            ),
-            closed.open,
-            closed.high,
-            closed.low,
-            closed.close,
-            self._direction(closed),
-            closed.timestamp,
-        )
-
-        return closed
-
-    # ============================================================
-    # GET CURRENT FORMING CANDLE
-    # ============================================================
-
-    async def get_current_forming_candle(
-        self,
-        instrument: str,
-        timeframe_seconds: int,
-    ) -> Optional[Candle]:
-        """
-        Повертає найсвіжішу формуючу свічку.
-
-        Вона використовується ТІЛЬКИ для confirmation.
-
-        Вона НЕ передається:
-
-            Supertrend
-            CandleCounter
-        """
-
-        candles = await self._get_sorted_candles(
-            instrument=instrument,
-            timeframe_seconds=timeframe_seconds,
-        )
-
-        if not candles:
-            return None
-
-        # --------------------------------------------------------
-        # Найсвіжіша = формуюча
-        # --------------------------------------------------------
-
-        forming = candles[-1]
-
-        previous_timestamp = (
-            self._last_forming_timestamp.get(
-                instrument
-            )
-        )
-
-        # --------------------------------------------------------
-        # Логуємо тільки коли почалася нова свічка
-        # --------------------------------------------------------
-
-# --------------------------------------------------------
-# Логуємо тільки коли почалася нова свічка
-# --------------------------------------------------------
-
-        if previous_timestamp != forming.timestamp:
-
-            self._last_forming_timestamp[
-                instrument
-            ] = forming.timestamp
-
-            logger.info(
-                "🟡 НОВА ФОРМУЮЧА СВІЧКА | %s | %s\n"
-                "   Open:  %.5f\n"
-                "   High:  %.5f\n"
-                "   Low:   %.5f\n"
-                "   Close: %.5f\n"
-                "   Напрямок: %s\n"
-                "   timestamp: %.0f",
-                instrument,
-                self._format_timestamp(
-                    forming.timestamp
-                ),
-                forming.open,
-                forming.high,
-                forming.low,
-                forming.close,
-                self._direction(forming),
-                forming.timestamp,
-            )
-        return forming
-    # ============================================================
-    # COMPATIBILITY
-    # ============================================================
-
-    async def get_latest_candle(
-        self,
-        instrument: str,
-        timeframe_seconds: int,
-    ) -> Optional[Candle]:
-        """
-        Старий метод для сумісності.
-
-        ПОВЕРТАЄ ТІЛЬКИ ЗАКРИТУ свічку.
-
-        Формуюча сюди не потрапляє.
-        """
-
-        return await self.get_latest_closed_candle(
-            instrument=instrument,
-            timeframe_seconds=timeframe_seconds,
-        )
 
     # ============================================================
     # DISCONNECT
     # ============================================================
 
     async def disconnect(self) -> None:
-        """
-        Відключення від Pocket Option.
-        """
-
         if self._client is None:
             return
-
         try:
-
             await self._client.disconnect()
-
-            logger.info(
-                "🔌 Відключено від Pocket Option."
-            )
-
+            logger.info("🔌 Відключено від Pocket Option.")
         finally:
-
             self._client = None

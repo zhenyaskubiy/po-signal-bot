@@ -175,7 +175,8 @@ async def main() -> None:
 
     if cfg.data_source == "pocket_option":
         feed = PocketOptionFeed(ssid=cfg.pocket_option.ssid, is_demo=cfg.pocket_option.is_demo)
-        await feed.connect()
+        # Передаємо весь список інструментів з конфігурації для автоматичної підписки
+        await feed.connect(instruments=cfg.instruments)
         run_loop = run_with_live_feed
         print("⚠️  РЕЖИМ РЕАЛЬНИХ ДАНИХ — сигнали базуються на живому ринку Pocket Option.")
     else:
