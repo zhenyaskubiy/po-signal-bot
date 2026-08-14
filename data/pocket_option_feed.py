@@ -20,9 +20,9 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
-
+import time
 from pocketoptionapi_async import AsyncPocketOptionClient
 
 from core.candle import Candle
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 class PocketOptionFeed:
-
+    
     def __init__(
         self,
         ssid: str,
@@ -126,14 +126,10 @@ class PocketOptionFeed:
     # ============================================================
     # TIMESTAMP
     # ============================================================
-
     @staticmethod
     def _timestamp_to_float(
         timestamp,
     ) -> Optional[float]:
-        """
-        Перетворення timestamp у Unix timestamp.
-        """
 
         if timestamp is None:
             return None
@@ -153,7 +149,6 @@ class PocketOptionFeed:
             OverflowError,
         ):
             return None
-
     # ============================================================
     # RAW -> Candle
     # ============================================================
@@ -350,20 +345,17 @@ class PocketOptionFeed:
     # ============================================================
 
     @staticmethod
-    def _format_timestamp(
-        timestamp: float,
-    ) -> str:
-        """
-        Unix timestamp -> UTC string.
-        """
+    def _format_timestamp(timestamp: float) -> str:
+        try:
+            return datetime.fromtimestamp(
+                timestamp,
+                tz=timezone.utc,
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
 
-        return datetime.fromtimestamp(
-            timestamp,
-            tz=timezone.utc,
-        ).strftime(
-            "%Y-%m-%d %H:%M:%S UTC"
-        )
-
+        except Exception:
+            return "INVALID"
     # ============================================================
     # DIRECTION
     # ============================================================
@@ -575,6 +567,10 @@ class PocketOptionFeed:
         # Логуємо тільки коли почалася нова свічка
         # --------------------------------------------------------
 
+# --------------------------------------------------------
+# Логуємо тільки коли почалася нова свічка
+# --------------------------------------------------------
+
         if previous_timestamp != forming.timestamp:
 
             self._last_forming_timestamp[
@@ -600,9 +596,7 @@ class PocketOptionFeed:
                 self._direction(forming),
                 forming.timestamp,
             )
-
         return forming
-
     # ============================================================
     # COMPATIBILITY
     # ============================================================
