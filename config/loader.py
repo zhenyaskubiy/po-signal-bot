@@ -1,12 +1,3 @@
-"""
-Завантаження та перевірка конфігурації з settings.yaml.
-
-Використання:
-    from config.loader import load_config
-    cfg = load_config()
-    print(cfg.timeframe_seconds)
-"""
-
 from __future__ import annotations
 
 import os

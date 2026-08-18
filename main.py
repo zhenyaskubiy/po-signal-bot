@@ -1,28 +1,8 @@
-"""
-Головна точка входу.
-
-Запускає:
-  1. Telegram-бота — /start підтверджує роботу, /settings відкриває
-     кнопки для зміни часу експірації та кількості антитрендових свічок
-     "на льоту", без редагування конфігурації чи перезапуску бота;
-  2. Цикл аналізу ринку по кожному інструменту (Supertrend → підрахунок
-     антитрендових свічок → черга сигналів) — на симульованих АБО
-     реальних даних Pocket Option, залежно від config/settings.yaml
-     (data_source: "simulator" / "pocket_option").
-
-Сигнали надсилаються в Telegram-чат, вказаний у config/settings.yaml
-(telegram.chat_id).
-
-Запуск:
-    python main.py
-Зупинка:
-    Ctrl+C
-"""
-
 from __future__ import annotations
 
 import asyncio
 import logging
+from users_manager import load_users, add_user
 
 from telegram import (
     BotCommand,
@@ -51,6 +31,9 @@ from data.simulator import SimulatedDataFeed
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# Завантажуємо базу користувачів при старті програми у set()
+known_users = load_users()
+
 # Варіанти, які пропонуються кнопками (можна відредагувати під потреби)
 EXPIRATION_OPTIONS_SECONDS = [60, 120, 180, 300, 600]  # 1, 2, 3, 5, 10 хвилин
 CANDLE_COUNT_OPTIONS = [3, 4, 5, 6, 7, 8]
@@ -66,11 +49,15 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if add_user(chat_id, known_users):
+        logger.info("✨ Новий користувач підписався на сигнали: %s", chat_id)
+    
     await update.message.reply_text(
         "✅ Бот запущений. Конфігурація завантажена успішно.",
         reply_markup=MAIN_KEYBOARD,
     )
-    logger.info("Відповів на /start для chat_id=%s", update.effective_chat.id)
+    logger.info("Відповів на /start для chat_id=%s", chat_id)
 
 
 def _chunk(items: list, size: int) -> list:
@@ -149,15 +136,12 @@ async def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CallbackQueryHandler(on_settings_button))
-    # Натискання постійної кнопки знизу екрана надсилає її текст як звичайне
-    # повідомлення — цей обробник ловить саме його і відкриває те саме меню.
     app.add_handler(MessageHandler(filters.Text([SETTINGS_BUTTON_LABEL]), cmd_settings))
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
 
-    # Список команд, який Telegram показує біля значка "/" у полі вводу
     await app.bot.set_my_commands(
         [
             BotCommand("start", "Перевірити, що бот працює"),
@@ -167,15 +151,22 @@ async def main() -> None:
     logger.info("Telegram-бот запущено, очікує /start і /settings.")
 
     async def on_signal(event: SignalEvent) -> None:
-        try:
-            await app.bot.send_message(chat_id=cfg.telegram.chat_id, text=event.message)
-            logger.info("Надіслано %s для %s", event.type.value, event.instrument)
-        except Exception as e:
-            logger.error("Не вдалося надіслати сигнал у Telegram: %s", e)
+        """Розсилає сформований сигнал усім підписаним користувачам із множини known_users."""
+        if not known_users:
+            logger.warning("Немає активних користувачів для розсилки сигналу.")
+            return
+
+        for chat_id in list(known_users):
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=event.message)
+            except Exception as e:
+                logger.error("Не вдалося надіслати сигнал для chat_id %s: %s", chat_id, e)
+                # Якщо користувач заблокував бота, можна за бажанням видалити його з known_users
+
+        logger.info("Надіслано %s для %s (усім користувачам)", event.type.value, event.instrument)
 
     if cfg.data_source == "pocket_option":
         feed = PocketOptionFeed(ssid=cfg.pocket_option.ssid, is_demo=cfg.pocket_option.is_demo)
-        # Передаємо весь список інструментів з конфігурації для автоматичної підписки
         await feed.connect(instruments=cfg.instruments)
         run_loop = run_with_live_feed
         print("⚠️  РЕЖИМ РЕАЛЬНИХ ДАНИХ — сигнали базуються на живому ринку Pocket Option.")
