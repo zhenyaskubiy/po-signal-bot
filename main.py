@@ -167,7 +167,17 @@ async def main() -> None:
 
     if cfg.data_source == "pocket_option":
         feed = PocketOptionFeed(ssid=cfg.pocket_option.ssid, is_demo=cfg.pocket_option.is_demo)
-        await feed.connect(instruments=cfg.instruments)
+        try:
+            await feed.connect(instruments=cfg.instruments)
+        except Exception as e:
+            error_msg = f"⚠️ Помилка! Не вдалося підключитися до Pocket Option: {str(e)}"
+            logger.error(error_msg)
+            for chat_id in list(known_users):
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=error_msg)
+                except Exception as send_err:
+                    logger.error("Не вдалося надіслати сповіщення про помилку для chat_id %s: %s", chat_id, send_err)
+            raise
         run_loop = run_with_live_feed
         print("⚠️  РЕЖИМ РЕАЛЬНИХ ДАНИХ — сигнали базуються на живому ринку Pocket Option.")
     else:

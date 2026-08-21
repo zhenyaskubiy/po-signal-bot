@@ -244,12 +244,13 @@ class InstrumentEngine:
             # Створюємо WARNING
             # ------------------------------------------------
 
-            warning = self.signal_queue.on_series_reached_four(
+            warning = self.signal_queue.on_series_reached(
                 instrument=self.instrument,
                 locked_color=state.locked_color,
                 payout=payout,
                 timeframe_seconds=self.timeframe_seconds,
                 expiration_seconds=self._expiration_seconds(),
+                required_candles=required, # передаємо кількість свічок з налаштувань
             )
 
             if warning is not None:
