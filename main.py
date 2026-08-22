@@ -116,12 +116,6 @@ async def on_settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         runtime_settings.set_required_candles(int(value))
         logger.info("Кількість свічок змінено на %s (chat_id=%s)", value, update.effective_chat.id)
         
-
-        engines = context.bot_data.get("engines", [])
-        for engine in engines:
-            if hasattr(engine, "reset_counter"):
-                engine.reset_counter()
-
     await query.answer("Збережено ✅")
     await query.edit_message_text(
         _settings_text(runtime_settings), reply_markup=_settings_keyboard(runtime_settings)

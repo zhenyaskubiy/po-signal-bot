@@ -69,7 +69,11 @@ class CandleCounter:
 
     def _color_for_direction(self, supertrend_direction: str) -> str:
         """Який колір вважається антитрендовим при даному напрямку Supertrend."""
-        return "bearish" if supertrend_direction == "BUY" else "bullish"
+        # Якщо тренд вниз (SELL), антитрендом є зелені свічки (bullish)
+        # Якщо тренд вгору (BUY), антитрендом є червоні свічки (bearish)
+        if supertrend_direction.upper() == "SELL":
+            return "bullish"
+        return "bearish"
 
     def _matches_color(self, candle: Candle, color: str) -> bool:
         return candle.is_bearish if color == "bearish" else candle.is_bullish
@@ -80,21 +84,14 @@ class CandleCounter:
     # ---------- головний метод ----------
 
     def update(self, candle: Candle, supertrend_direction: str, supertrend_changed: bool) -> SeriesState:
-        """
-        Додає нову свічку і повертає поточний стан серії.
-
-        supertrend_direction — поточний напрямок Supertrend ("BUY"/"SELL").
-        supertrend_changed — True, якщо напрямок Supertrend змінився саме на цій свічці.
-        """
-        if supertrend_changed and self._state.active and self._state.count < 2:
-            # Зміна відбулась зарано (до 2 підрахованих свічок) — серія недійсна
+        # ЗАХИСТ: Якщо напрямок Supertrend змінився в процесі активної серії — одразу скидаємо її, 
+        # щоб не торгувати за застарілим трендом!
+        if supertrend_changed and self._state.active:
             self._reset()
 
         if self._state.active:
-            # Серія вже йде — колір антитрендової свічки "заблокований" з моменту старту
             anti_trend_color = self._state.locked_color
         else:
-            # Серія ще не почалась — колір визначається поточним напрямком Supertrend
             anti_trend_color = self._color_for_direction(supertrend_direction)
 
         is_anti_trend = self._matches_color(candle, anti_trend_color)
@@ -103,18 +100,12 @@ class CandleCounter:
             body_class = self._classify_body(candle)
 
             if not self._state.active:
-                # Старт серії: перша свічка має обов'язково бути середньою або великою
                 if body_class in (BodySize.MEDIUM, BodySize.LARGE):
                     self._state = SeriesState(active=True, count=1, locked_color=anti_trend_color)
-                # маленька/доджі до старту — ігнорується, серія не починається
             else:
-                # Продовження активної серії (свічка того ж заблокованого кольору)
                 self._state.count += 1
         else:
-            # Якщо серія вже активна, але прийшла свічка НЕ антитрендового кольору (переривання),
-            # або якщо серія не активна, але прийшла протилежна свічка — обробляємо розрив.
             if self._state.active:
-                # Побажання клієнта: якщо ланцюжок перервався свічкою іншого кольору — скидаємо серію
                 self._reset()
 
         self._remember_body(candle)
