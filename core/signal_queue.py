@@ -1,18 +1,3 @@
-"""
-Черга сигналів (п.8, 9, 12 ТЗ).
-
-Коли серія антитрендових свічок (з core/candle_counter.py) досягає потрібної кількості,
-надсилається попередження (🟡). Через налаштований час (10-50 сек — з
-конфігурації) перевіряється, чи свічка, яка ЗАРАЗ формується,
-залишається антитрендовою. Якщо так — надсилається основний сигнал
-(🟢 CALL / 🔴 PUT). Якщо ні — сигнал просто скасовується, без відправки.
-
-Захист від дублікатів (п.12): по одній ситуації — рівно одне попередження
-і рівно одне підтвердження (або мовчазне скасування). Поки ситуація не
-розв'язана (confirmed чи invalidated), нове попередження по тому самому
-інструменту не створюється.
-"""
-
 from __future__ import annotations
 
 import time
@@ -24,7 +9,6 @@ from core.candle import Candle
 
 
 class SignalType(Enum):
-    WARNING = "warning"
     CALL = "CALL"
     PUT = "PUT"
 
@@ -47,13 +31,14 @@ class _PendingConfirmation:
     payout: float
     timeframe_seconds: int
     expiration_seconds: int
+    required_candles: int
     resolved: bool = False
 
 
 class SignalQueue:
     """
-    Один екземпляр на весь бот — веде чергу одразу для всіх інструментів,
-    щоб дедублікація (п.12) керувалась з одного місця.
+    Черга сигналів без попереджень: при досягненні серії одразу запускається 
+    очікування підтвердження, а фінальний сигнал містить кількість свічок.
     """
 
     def __init__(self, confirmation_delay_seconds: int = 30):
@@ -69,19 +54,15 @@ class SignalQueue:
         expiration_seconds: int,
         required_candles: int,
         now: Optional[float] = None,
-    ) -> Optional[SignalEvent]:
+    ) -> None:
         """
-        Викликайте, коли серія антитрендових свічок інструменту щойно
-        досягла потрібної кількості з налаштувань.
-
-        Повертає попередження — рівно один раз на ситуацію. Якщо для цього
-        інструменту вже є непідтверджена ситуація в черзі, повертає None
-        (захист від дублікатів).
+        Викликається, коли серія досягла потрібної кількості. 
+        Попередження більше не надсилається (повертає None), лише реєструється очікування.
         """
         now = now if now is not None else time.time()
 
         if instrument in self._pending and not self._pending[instrument].resolved:
-            return None
+            return
 
         self._pending[instrument] = _PendingConfirmation(
             instrument=instrument,
@@ -90,39 +71,15 @@ class SignalQueue:
             payout=payout,
             timeframe_seconds=timeframe_seconds,
             expiration_seconds=expiration_seconds,
-        )
-
-        direction_label = "PUT (SELL)" if locked_color == "bearish" else "CALL (BUY)"
-        message = (
-            "🟡 Попередження\n"
-            f"Інструмент: {instrument}\n"
-            f"Напрямок: {direction_label}\n"
-            f"Таймфрейм: {timeframe_seconds} сек\n"
-            f"Експірація: {expiration_seconds} сек\n"
-            f"Закрилися {required_candles} антитрендові свічки. Очікуємо підтвердження."
-        )
-        return SignalEvent(
-            type=SignalType.WARNING,
-            instrument=instrument,
-            payout=payout,
-            timeframe_seconds=timeframe_seconds,
-            expiration_seconds=expiration_seconds,
-            message=message,
+            required_candles=required_candles,
         )
 
     def check_confirmation(
         self, instrument: str, forming_candle: Candle, now: Optional[float] = None
     ) -> Optional[SignalEvent]:
         """
-        Викликайте регулярно (наприклад, раз на секунду) для кожного
-        інструменту, поки для нього є непідтверджена ситуація в черзі.
-
-        forming_candle — свічка, яка ЗАРАЗ формується, з поточними,
-        ще не фінальними high/low/close на момент виклику.
-
-        Повертає основний сигнал, якщо час настав і свічка досі
-        антитрендова. Повертає None, якщо ще не час, або якщо час настав,
-        але свічка вже розвернулась (сигнал мовчки скасовується).
+        Перевіряє формуючу свічку після закінчення затримки та формує 
+        фінальний сигнал із кількістю свічок.
         """
         pending = self._pending.get(instrument)
         if pending is None or pending.resolved:
@@ -132,21 +89,23 @@ class SignalQueue:
         if now < pending.deadline:
             return None  # ще не час перевіряти
 
-        pending.resolved = True  # ситуація закрита незалежно від результату (п.12)
+        pending.resolved = True  # ситуація закрита
 
         still_anti_trend = (
             forming_candle.is_bearish if pending.locked_color == "bearish" else forming_candle.is_bullish
         )
         if not still_anti_trend:
-            return None  # формуюча свічка розвернулась — сигнал не підтвердився
+            return None  # формуюча свічка розвернулась — сигнал скасовано мовчки
 
         signal_type = SignalType.PUT if pending.locked_color == "bearish" else SignalType.CALL
         emoji = "🔴" if signal_type == SignalType.PUT else "🟢"
+        
         message = (
             f"{emoji} {signal_type.value}\n"
             f"Інструмент: {instrument}\n"
             f"Таймфрейм: {pending.timeframe_seconds} сек\n"
-            f"Експірація: {pending.expiration_seconds} сек"
+            f"Експірація: {pending.expiration_seconds} сек\n"
+            f"Закрилися {pending.required_candles} антитрендові свічки."
         )
         return SignalEvent(
             type=signal_type,

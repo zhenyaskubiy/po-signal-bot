@@ -135,6 +135,16 @@ class InstrumentEngine:
 
         return self.timeframe_seconds
 
+    def reset_counter(self) -> None:
+        """
+        Скидає лічильник свічок і час останньої обробленої свічки,
+        щоб бот почав підрахунок із чистого аркуста після зміни налаштувань.
+        """
+        self.candle_counter.state.count = 0
+        self.candle_counter.state.locked_color = None
+        self._last_processed_timestamp = None
+        logger.info("%s: 🔄 Лічильник серії скинуто через зміну налаштувань.", self.instrument)
+
     # --------------------------------------------------------
     # Обробка однієї ЗАКРИТОЇ свічки
     # --------------------------------------------------------
@@ -240,28 +250,24 @@ class InstrumentEngine:
                 )
                 return
 
-            # ------------------------------------------------
-            # Створюємо WARNING
+# ------------------------------------------------
+            # Реєструємо досягнення серії (без відправки попереджень)
             # ------------------------------------------------
 
-            warning = self.signal_queue.on_series_reached(
+            self.signal_queue.on_series_reached(
                 instrument=self.instrument,
                 locked_color=state.locked_color,
                 payout=payout,
                 timeframe_seconds=self.timeframe_seconds,
                 expiration_seconds=self._expiration_seconds(),
-                required_candles=required, # передаємо кількість свічок з налаштувань
+                required_candles=required,
             )
 
-            if warning is not None:
-                logger.info(
-                    "%s: 🟡 Створено WARNING | серія=%d | колір=%s",
-                    self.instrument,
-                    state.count,
-                    state.locked_color,
-                )
-
-                await on_signal(warning)
+            logger.info(
+                "%s: Серія досягла %d | Очікуємо підтвердження (без попередження)",
+                self.instrument,
+                state.count,
+            )
 
     # --------------------------------------------------------
     # Перевірка поточної формуючої свічки

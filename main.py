@@ -115,6 +115,12 @@ async def on_settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif kind == "cnt":
         runtime_settings.set_required_candles(int(value))
         logger.info("Кількість свічок змінено на %s (chat_id=%s)", value, update.effective_chat.id)
+        
+
+        engines = context.bot_data.get("engines", [])
+        for engine in engines:
+            if hasattr(engine, "reset_counter"):
+                engine.reset_counter()
 
     await query.answer("Збережено ✅")
     await query.edit_message_text(
@@ -198,6 +204,7 @@ async def main() -> None:
         )
         for instrument in cfg.instruments
     ]
+    app.bot_data["engines"] = engines
 
     print(f"✅ Бот запущений. Аналізую {len(engines)} інструмент(ів) — джерело: {cfg.data_source}.")
     print("У Telegram: /start — перевірка зв'язку, /settings — змінити параметри. Ctrl+C — вихід.\n")

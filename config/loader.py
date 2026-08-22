@@ -99,7 +99,7 @@ def _validate(cfg: BotConfig) -> None:
         raise ConfigError("supertrend.multiplier повинен бути додатним числом.")
     if not (0 <= cfg.min_payout_percent <= 100):
         raise ConfigError("min_payout_percent повинен бути в межах 0-100.")
-    if cfg.confirmation_delay_seconds <= 0:
+    if cfg.confirmation_delay_seconds < 0:
         raise ConfigError("confirmation_delay_seconds повинен бути додатним числом.")
     if cfg.data_source not in ("simulator", "pocket_option"):
         raise ConfigError("data_source повинен бути 'simulator' або 'pocket_option'.")
